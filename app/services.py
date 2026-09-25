@@ -1,8 +1,8 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准。"""
 import hashlib
 import json
 import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from fastapi import HTTPException, status
@@ -1031,4 +1031,219 @@ def reconcile_handoffs(
             for item in removed
         ],
         common_boxes=common_boxes,
+    )
+
+
+def _load_calibration(
+    db: Session, box_code: str, version: int
+) -> tuple[models.CalibrationSet, list[models.CalibrationAnchor]] | None:
+    """按箱号 + 版本号读取校准头与锚点（按 position 升序）；不存在返回 None。"""
+    calib = db.scalar(
+        select(models.CalibrationSet).where(
+            models.CalibrationSet.box_code == box_code,
+            models.CalibrationSet.version == version,
+        )
+    )
+    if calib is None:
+        return None
+    anchors = list(
+        db.scalars(
+            select(models.CalibrationAnchor)
+            .where(models.CalibrationAnchor.calibration_id == calib.id)
+            .order_by(models.CalibrationAnchor.position)
+        ).all()
+    )
+    return calib, anchors
+
+
+def _calibration_content_equal(
+    anchors: list[models.CalibrationAnchor], payload: schemas.CalibrationIn
+) -> bool:
+    """已存锚点与本次请求内容是否一致（逐点比较序号与温度偏移）。
+
+    客户端重试会原样重发 JSON，float 解析结果相同，故偏移直接判等；
+    序号已由 schema 保证严格递增，按提交顺序逐点比较即可。
+    """
+    if len(anchors) != len(payload.anchors):
+        return False
+    return all(
+        anchor.seq == point.seq and anchor.temp_offset == point.temp_offset
+        for anchor, point in zip(anchors, payload.anchors)
+    )
+
+
+def _calibration_conflict(
+    payload: schemas.CalibrationIn,
+    calib: models.CalibrationSet,
+    anchors: list[models.CalibrationAnchor],
+) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "calibration_conflict",
+            "message": (
+                f"箱号 {payload.box_code} 的版本 {payload.version} 已存在校准锚点，"
+                "但本次提交的锚点内容与其不一致，已拒绝（锚点不可变）"
+            ),
+            "existing": {
+                "box_code": calib.box_code,
+                "version": calib.version,
+                "anchors": [
+                    {"seq": a.seq, "temp_offset": a.temp_offset} for a in anchors
+                ],
+            },
+            "received": {
+                "box_code": payload.box_code,
+                "version": payload.version,
+                "anchors": [
+                    {"seq": p.seq, "temp_offset": p.temp_offset}
+                    for p in payload.anchors
+                ],
+            },
+        },
+    )
+
+
+def save_calibration(
+    db: Session, payload: schemas.CalibrationIn
+) -> tuple[models.CalibrationSet, list[models.CalibrationAnchor], bool]:
+    """按箱号 + 版本号保存一份不可变的校准锚点列表。
+
+    返回 (校准头, 锚点行, 是否新建)。
+    - (box_code, version) 不存在：同一事务写入头行与全部锚点（至少 2 个，
+      序号严格递增、偏移有限，均已由 schema 校验）后一次提交
+    - 已存在且锚点内容（逐点序号与偏移）一致：幂等返回原列表，不写入任何行
+    - 已存在但内容不同：拒绝（409），锚点不可变
+    校准表只增不改，不提供更新入口；保存校准不会触碰 box_events 等任何既有数据。
+    """
+    existing = _load_calibration(db, payload.box_code, payload.version)
+    if existing is not None:
+        calib, anchors = existing
+        if not _calibration_content_equal(anchors, payload):
+            raise _calibration_conflict(payload, calib, anchors)
+        return calib, anchors, False
+
+    calib = models.CalibrationSet(
+        box_code=payload.box_code,
+        version=payload.version,
+        anchor_count=len(payload.anchors),
+    )
+    db.add(calib)
+    try:
+        db.flush()  # 取得 id，同时触发 (box_code, version) 唯一约束，兜住并发提交
+    except IntegrityError:
+        db.rollback()
+        # 并发请求抢先保存：以库中锚点为准重新判定
+        existing = _load_calibration(db, payload.box_code, payload.version)
+        if existing is None:  # 理论上不会发生
+            raise
+        calib, anchors = existing
+        if not _calibration_content_equal(anchors, payload):
+            raise _calibration_conflict(payload, calib, anchors)
+        return calib, anchors, False
+
+    anchors = [
+        models.CalibrationAnchor(
+            calibration_id=calib.id,
+            position=position,
+            seq=point.seq,
+            temp_offset=point.temp_offset,
+        )
+        for position, point in enumerate(payload.anchors)
+    ]
+    db.add_all(anchors)
+    db.commit()
+    return calib, anchors, True
+
+
+def get_calibration(
+    db: Session, box_code: str, version: int
+) -> tuple[models.CalibrationSet, list[models.CalibrationAnchor]] | None:
+    """按箱号 + 版本号查询已保存的校准锚点；不存在返回 None，由路由层转 404。"""
+    return _load_calibration(db, box_code, version)
+
+
+def _anchor_offset_fraction(
+    anchor_seqs: list[int], anchor_offsets: list[Fraction], seq: int
+) -> Fraction:
+    """序号 seq 处的温度偏移（Fraction 精确值）。
+
+    - seq 恰好落在锚点上：该锚点偏移
+    - 位于两个相邻锚点之间：按序号线性插值（与事件时间无关）
+    - 早于首个锚点 / 晚于末个锚点：两端沿用最近锚点偏移（钳平，不外推）
+    anchor_seqs 严格递增，调用方保证至少两个锚点。
+    """
+    idx = bisect_right(anchor_seqs, seq)
+    if idx == 0:
+        return anchor_offsets[0]
+    if idx >= len(anchor_seqs):
+        return anchor_offsets[-1]
+    seq_lo, seq_hi = anchor_seqs[idx - 1], anchor_seqs[idx]
+    if seq == seq_lo:
+        return anchor_offsets[idx - 1]
+    ratio = Fraction(seq - seq_lo, seq_hi - seq_lo)
+    return anchor_offsets[idx - 1] + (
+        anchor_offsets[idx] - anchor_offsets[idx - 1]
+    ) * ratio
+
+
+def calibration_trajectory(
+    db: Session,
+    box_code: str,
+    version: int,
+    seq_from: int,
+    seq_to: int,
+) -> schemas.CalibrationTrajectoryResult | None:
+    """用指定版本的校准锚点计算区间事件的温度漂移校准轨迹（只读即时计算）。
+
+    - 按 seq 升序取闭区间 [seq_from, seq_to] 内的实际事件，缺报序号不补事件
+      （区间无事件返回 event_count=0、points=[]，不会因缺号造点）
+    - 每条事件的偏移：相邻锚点之间按序号线性插值；区间两端（含锚点序号范围之外）
+      沿用最近锚点偏移，不做外推
+    - 校准温度 = 原始温度 + 偏移，用 Fraction 精确插值后转 float
+    - 校准结果只用于本接口返回：不写库、不改写原始事件，也不影响最新状态、
+      交接快照与 clock-audit / heat-exposure 等既有分析接口
+    - 指定版本不存在返回 None，由路由层转 404
+    """
+    loaded = _load_calibration(db, box_code, version)
+    if loaded is None:
+        return None
+    _, anchors = loaded
+
+    anchor_seqs = [a.seq for a in anchors]
+    anchor_offsets = [Fraction(a.temp_offset) for a in anchors]
+
+    events = list(
+        db.scalars(
+            select(models.BoxEvent)
+            .where(
+                models.BoxEvent.box_code == box_code,
+                models.BoxEvent.seq >= seq_from,
+                models.BoxEvent.seq <= seq_to,
+            )
+            .order_by(models.BoxEvent.seq)
+        ).all()
+    )
+
+    points: list[schemas.CalibrationPoint] = []
+    for event in events:
+        offset = _anchor_offset_fraction(anchor_seqs, anchor_offsets, event.seq)
+        calibrated = Fraction(event.temperature) + offset
+        points.append(
+            schemas.CalibrationPoint(
+                seq=event.seq,
+                event_time=event.event_time,
+                temperature=event.temperature,
+                temp_offset=float(offset),
+                calibrated_temperature=float(calibrated),
+            )
+        )
+
+    return schemas.CalibrationTrajectoryResult(
+        box_code=box_code,
+        version=version,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        event_count=len(events),
+        points=points,
     )

@@ -8,6 +8,11 @@ box_events：同箱号 + 同序号在库中唯一：
 handoff_snapshots / handoff_snapshot_items：交接快照及其逐箱冻结明细。
 handoff_code 全局唯一，作为幂等键；明细行在创建时一次性写入，之后只读，
 后续事件补报（含乱序）不会改写已建快照。
+
+calibration_sets / calibration_anchors：按箱号 + 版本号保存的温度漂移校准
+锚点列表。(box_code, version) 唯一，作为幂等键；锚点行在创建时一次性写入，
+之后只增不改。校准结果只被 /calibration-trajectory 接口读取，不会改写
+box_events、快照或任何既有分析结果。
 """
 from datetime import datetime
 
@@ -98,3 +103,57 @@ class HandoffSnapshotItem(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<HandoffSnapshotItem handoff={self.handoff_id} {self.box_code} {self.status}>"
+
+
+class CalibrationSet(Base):
+    """一次按箱号 + 版本号保存的温度漂移校准锚点列表：唯一键 (box_code, version)。
+
+    头行与锚点行在创建时同一事务写入，之后只读；同箱同版本原样重交幂等
+    返回原列表，异内容返回冲突，服务层不提供任何更新入口。
+    """
+
+    __tablename__ = "calibration_sets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    box_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    anchor_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("box_code", "version", name="uq_calibration_box_version"),
+        Index("ix_calibration_box_code", "box_code"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<CalibrationSet {self.box_code} v{self.version} anchors={self.anchor_count}>"
+
+
+class CalibrationAnchor(Base):
+    """校准锚点：在某序号处测得的有限温度偏移（℃）。
+
+    属于某个 CalibrationSet，按 position（提交顺序，从 0 开始）存储；
+    提交时序号已由 schema 校验为严格递增，position 与 seq 升序一致。
+    """
+
+    __tablename__ = "calibration_anchors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    calibration_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("calibration_sets.id"), nullable=False
+    )
+    # 锚点在提交列表中的原始位置（从 0 开始），用于按序回放与内容比对
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 该序号处的温度偏移（℃），校准温度 = 原温度 + 偏移；须为有限值
+    temp_offset: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("calibration_id", "seq", name="uq_calibration_anchor_seq"),
+        Index("ix_calibration_anchors_calibration", "calibration_id"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<CalibrationAnchor calibration={self.calibration_id} seq={self.seq} offset={self.temp_offset}>"
