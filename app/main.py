@@ -33,8 +33,12 @@ app = FastAPI(
         "同编号同内容幂等返回原快照，内容不同拒绝（409）；快照只读，不受后续补报影响\n"
         "- 交接对账：GET /handoffs/{from_code}/reconcile/{to_code} 只读比较两份已冻结快照，"
         "给出新增/移出箱、共同箱结论变化与最少移动箱数\n"
+        "- 温度漂移校准：POST /boxes/{box_code}/calibrations 按箱号 + 版本号保存不可变校准锚点"
+        "（至少两个、序号严格递增）；同箱同版本同内容幂等、异内容 409；"
+        "GET /boxes/{box_code}/calibrations/{version}/trajectory 按区间返回逐条校准轨迹"
+        "（相邻锚点线性插值偏移，两端沿用最近锚点，缺报序号不补），只读不写回\n"
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -386,6 +390,97 @@ def get_box_trajectory_compression(
         )
     result = services.trajectory_compression(
         db, box_code.strip(), seq_from, seq_to, max_error
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
+    return result
+
+
+def _calibration_out(
+    profile: models.CalibrationProfile, anchors: list[models.CalibrationAnchor]
+) -> schemas.CalibrationProfileOut:
+    return schemas.CalibrationProfileOut(
+        box_code=profile.box_code,
+        version=profile.version,
+        anchor_count=profile.anchor_count,
+        created_at=profile.created_at,
+        anchors=[
+            schemas.CalibrationAnchorOut(seq=anchor.seq, offset=anchor.offset)
+            for anchor in anchors
+        ],
+    )
+
+
+@app.post(
+    "/boxes/{box_code}/calibrations",
+    tags=["calibrations"],
+    response_model=schemas.CalibrationProfileOut,
+    summary="保存某箱某版本的温度漂移校准锚点集（不可变，幂等）",
+)
+def post_calibration(
+    box_code: str,
+    payload: schemas.CalibrationProfileIn,
+    db: DbSession,
+    response: Response,
+) -> schemas.CalibrationProfileOut:
+    profile, anchors, created = services.create_calibration_profile(
+        db, box_code.strip(), payload
+    )
+    # 新建 201；同箱同版本同内容的重复提交 200，返回原锚点集
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _calibration_out(profile, anchors)
+
+
+@app.get(
+    "/boxes/{box_code}/calibrations/{version}",
+    tags=["calibrations"],
+    response_model=schemas.CalibrationProfileOut,
+    summary="读取某箱某版本已保存的校准锚点集",
+)
+def get_calibration(
+    box_code: str, version: str, db: DbSession
+) -> schemas.CalibrationProfileOut:
+    loaded = services.get_calibration_profile(db, box_code.strip(), version.strip())
+    if loaded is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "calibration_not_found",
+                "box_code": box_code,
+                "version": version,
+            },
+        )
+    profile, anchors = loaded
+    return _calibration_out(profile, anchors)
+
+
+@app.get(
+    "/boxes/{box_code}/calibrations/{version}/trajectory",
+    tags=["calibrations"],
+    response_model=schemas.CalibrationTrajectoryResult,
+    summary="指定版本与序号区间的校准轨迹（锚点间线性插值偏移，只读不写回）",
+)
+def get_calibration_trajectory(
+    box_code: str,
+    version: str,
+    db: DbSession,
+    seq_from: Annotated[int, Query(ge=0, description="起始序号（含）")],
+    seq_to: Annotated[int, Query(ge=0, description="结束序号（含）")],
+) -> schemas.CalibrationTrajectoryResult:
+    if seq_from > seq_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_range",
+                "message": f"seq_from({seq_from}) 不能大于 seq_to({seq_to})",
+                "seq_from": seq_from,
+                "seq_to": seq_to,
+            },
+        )
+    result = services.calibration_trajectory(
+        db, box_code.strip(), version.strip(), seq_from, seq_to
     )
     if result is None:
         raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})

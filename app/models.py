@@ -8,6 +8,11 @@ box_events：同箱号 + 同序号在库中唯一：
 handoff_snapshots / handoff_snapshot_items：交接快照及其逐箱冻结明细。
 handoff_code 全局唯一，作为幂等键；明细行在创建时一次性写入，之后只读，
 后续事件补报（含乱序）不会改写已建快照。
+
+calibration_profiles / calibration_anchors：温度漂移校准锚点集及其锚点明细。
+(box_code, version) 唯一，作为幂等键；锚点在创建时一次性写入（序号严格递增、
+至少两个），之后只读不可变：同箱同版本同内容的重复提交幂等返回原锚点集，
+内容不同拒绝（HTTP 409）。校准只在新接口查询时即时计算，不回写 box_events。
 """
 from datetime import datetime
 
@@ -98,3 +103,48 @@ class HandoffSnapshotItem(Base):
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<HandoffSnapshotItem handoff={self.handoff_id} {self.box_code} {self.status}>"
+
+
+class CalibrationProfile(Base):
+    """某箱某版本的温度漂移校准锚点集：(box_code, version) 唯一，落库后只读。"""
+
+    __tablename__ = "calibration_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    box_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    anchor_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("box_code", "version", name="uq_calibration_box_version"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<CalibrationProfile {self.box_code}@{self.version} anchors={self.anchor_count}>"
+
+
+class CalibrationAnchor(Base):
+    """锚点集内的一个校准锚点：事件序号 -> 温度偏移，创建后只读不可变。"""
+
+    __tablename__ = "calibration_anchors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    profile_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("calibration_profiles.id"), nullable=False
+    )
+    # 锚点在请求列表中的原始位置（从 0 开始），用于按原顺序回放与内容比对
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 列名用 temp_offset，避开 SQL 关键字 OFFSET；属性名仍为 offset
+    offset: Mapped[float] = mapped_column("temp_offset", Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("profile_id", "seq", name="uq_calibration_profile_seq"),
+        Index("ix_calibration_anchors_profile", "profile_id"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<CalibrationAnchor profile={self.profile_id} seq={self.seq} offset={self.offset}>"

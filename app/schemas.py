@@ -301,3 +301,77 @@ class TemperatureMedianResult(BaseModel):
             "无有效段时为 null"
         ),
     )
+
+
+class CalibrationAnchorIn(BaseModel):
+    seq: int = Field(..., ge=0, description="锚点事件序号，非负整数；列表内须严格递增")
+    offset: float = Field(
+        ..., allow_inf_nan=False, description="该序号处的温度偏移（℃），须为有限数值"
+    )
+
+
+class CalibrationProfileIn(BaseModel):
+    version: str = Field(
+        ..., min_length=1, max_length=64, description="校准版本号，同箱内唯一，作为幂等键的一部分"
+    )
+    anchors: list[CalibrationAnchorIn] = Field(
+        ..., min_length=2, description="校准锚点列表，至少 2 个，序号严格递增"
+    )
+
+    @field_validator("version")
+    @classmethod
+    def _strip_version(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("version 不能为空")
+        return v
+
+    @field_validator("anchors")
+    @classmethod
+    def _check_strictly_increasing(
+        cls, v: list[CalibrationAnchorIn]
+    ) -> list[CalibrationAnchorIn]:
+        for prev, cur in zip(v, v[1:]):
+            if cur.seq <= prev.seq:
+                raise ValueError(
+                    f"锚点序号必须严格递增：{prev.seq} 之后出现 {cur.seq}"
+                )
+        return v
+
+
+class CalibrationAnchorOut(BaseModel):
+    seq: int = Field(..., description="锚点事件序号")
+    offset: float = Field(..., description="该序号处的温度偏移（℃）")
+
+
+class CalibrationProfileOut(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    version: str = Field(..., description="校准版本号")
+    anchor_count: int = Field(..., description="锚点数量（>= 2）")
+    created_at: datetime = Field(..., description="锚点集创建时间（UTC）")
+    anchors: list[CalibrationAnchorOut] = Field(
+        ..., description="锚点列表，顺序与创建请求一致（序号严格递增）"
+    )
+
+
+class CalibratedEventPoint(BaseModel):
+    seq: int = Field(..., description="事件序号")
+    event_time: datetime = Field(..., description="原始 UTC 事件时间（不改动原始记录）")
+    original_temperature: float = Field(..., description="库中原始温度（℃），未被修改")
+    offset: float = Field(
+        ..., description="该序号处的温度偏移（℃）：相邻锚点间线性插值，两端沿用最近锚点"
+    )
+    calibrated_temperature: float = Field(
+        ..., description="校准温度（℃）= 原温度 + 偏移；仅用于本接口，不写回"
+    )
+
+
+class CalibrationTrajectoryResult(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    version: str = Field(..., description="使用的校准版本号")
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    event_count: int = Field(..., description="区间内实际事件条数（缺报序号不补）")
+    events: list[CalibratedEventPoint] = Field(
+        ..., description="逐条校准结果（按序号升序），只含区间内实际存在的事件"
+    )

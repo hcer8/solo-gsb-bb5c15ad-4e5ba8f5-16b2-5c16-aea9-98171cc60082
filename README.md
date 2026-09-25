@@ -14,6 +14,13 @@
 两份快照之间可用 `GET /handoffs/{from_code}/reconcile/{to_code}` **只读对账**：
 比较冻结明细得出新增/移出箱、共同箱结论变化与最少移动箱数，不重新查询箱子当前事件。
 
+还支持**温度漂移校准**：`POST /boxes/{box_code}/calibrations` 按**箱号 + 版本号**
+保存一组**不可变**的校准锚点（事件序号 → 温度偏移，至少两个、序号严格递增）；
+同箱同版本原样重交幂等返回，内容不同拒绝（`409`）。
+`GET /boxes/{box_code}/calibrations/{version}/trajectory` 按序号区间返回逐条校准轨迹：
+相邻锚点间按序号**线性插值**偏移，区间两端沿用最近锚点偏移，缺报序号不补事件。
+校准只在查询时即时计算，**不改写原始事件**，也不影响现有状态与分析结果。
+
 ## 目录结构
 
 ```
@@ -22,9 +29,9 @@
 │   ├── __init__.py
 │   ├── config.py          # 环境变量配置
 │   ├── database.py        # 引擎/会话，启动建表
-│   ├── models.py          # BoxEvent 与交接快照模型，(box_code, seq)、handoff_code 唯一约束
+│   ├── models.py          # BoxEvent、交接快照与校准锚点模型，(box_code, seq)、handoff_code、(box_code, version) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -106,6 +113,9 @@ APP_PORT=9000 docker compose up -d --build
 | POST | `/handoffs`                     | 创建交接快照（同一事务冻结各箱当前最大序号的状态，幂等） |
 | GET  | `/handoffs/{handoff_code}`      | 交接快照的冻结明细与各类数量               |
 | GET  | `/handoffs/{from_code}/reconcile/{to_code}` | 只读对账两份交接快照：新增/移出箱、共同箱结论变化与最少移动箱数 |
+| POST | `/boxes/{box_code}/calibrations` | 保存某箱某版本的温度漂移校准锚点集（不可变，幂等） |
+| GET  | `/boxes/{box_code}/calibrations/{version}` | 读取某箱某版本已保存的校准锚点集 |
+| GET  | `/boxes/{box_code}/calibrations/{version}/trajectory` | 指定版本与序号区间的校准轨迹（锚点间线性插值偏移，只读不写回） |
 
 ### 上报事件
 
@@ -863,6 +873,108 @@ curl -i http://localhost:8000/handoffs/HO-20260924-01/reconcile/NO-SUCH-HANDOFF
 curl -i http://localhost:8000/handoffs/NO-SUCH-HANDOFF/reconcile/HO-20260924-01
 ```
 
+## 温度漂移校准（calibrations）
+
+设备温度传感器存在漂移时，可按**箱号 + 版本号**保存一组**校准锚点**
+（事件序号 → 温度偏移），再用 `trajectory` 接口按序号区间查询**校准后的温度轨迹**。
+服务经 `docker compose up -d --build` 启动后（见上文“一键启动”与“配置”），
+以下示例均访问 `http://localhost:8000`。
+
+`POST /boxes/{box_code}/calibrations` 请求体：
+
+```json
+{
+  "version": "v1",
+  "anchors": [
+    {"seq": 0, "offset": 0.5},
+    {"seq": 2, "offset": 1.5},
+    {"seq": 4, "offset": -0.5}
+  ]
+}
+```
+
+字段与校验（不满足返回 `422`）：
+
+- `version`：校准版本号，去空白后非空（≤64 字符）；**同箱内唯一**，与箱号一起作为幂等键。
+- `anchors`：校准锚点列表，**至少 2 个**；每个锚点含：
+  - `seq`：锚点事件序号，非负整数；列表内**序号必须严格递增**（重复或逆序即 `422`）；
+  - `offset`：该序号处的温度偏移（℃），须为**有限数值**（`NaN`/`Infinity` 拒绝）。
+
+幂等与不可变：
+
+- 锚点集落库后**只读不可变**，不提供修改/删除接口；
+- 同箱同版本且锚点列表（含顺序）一致的重交 → 幂等返回原锚点集（`200`），不改写任何数据；
+- 同箱同版本但锚点内容不同 → `409 Conflict`，响应体带已存与本次提交的锚点列表，便于排查；
+- 新建成功 → `201 Created`；同箱**不同版本**互不影响，可各自保存。
+
+`GET /boxes/{box_code}/calibrations/{version}` 读取已保存的锚点集；
+`GET /boxes/{box_code}/calibrations/{version}/trajectory?seq_from=&seq_to=` 返回校准轨迹：
+
+- 按 `seq` 升序取闭区间 `[seq_from, seq_to]` 内**实际已存事件**（**缺报序号不补事件**），
+  逐条返回原温度、偏移与校准温度（**校准温度 = 原温度 + 偏移**）；
+- 偏移取值：相邻锚点之间按序号**线性插值**；超出首末锚点范围的序号**沿用最近锚点**的偏移；
+- 校准结果**只用于本接口**：查询时即时计算，不改写原始事件，
+  也不影响 `/state`、`/events`、`heat-exposure` 等现有状态与分析结果；
+- 箱号不存在返回 `404`（`box_not_found`）；该箱该版本锚点集不存在返回 `404`
+  （`calibration_not_found`）；区间内无事件返回 `200` 与空轨迹；
+  `seq_from > seq_to`、负数序号等返回 `422`。
+
+```bash
+# 先上报 5 条事件（UTC；注意跳过 seq=3，缺报不补）
+for i in 0 1 2 4 5; do
+  curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+    -d "{\"box_code\":\"BOX-CAL\",\"seq\":$i,\"temperature\":-5.0,
+         \"event_time\":\"2026-09-25T00:0$i:00+00:00\"}"
+done
+
+# 保存校准锚点集：seq=0 偏移 +0.5，seq=2 偏移 +1.5，seq=4 偏移 -0.5
+curl -X POST http://localhost:8000/boxes/BOX-CAL/calibrations \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"v1","anchors":[
+        {"seq":0,"offset":0.5},{"seq":2,"offset":1.5},{"seq":4,"offset":-0.5}]}'
+# -> 201 Created；原样重交 -> 200；改内容重交 -> 409
+
+# 读取已保存的锚点集
+curl http://localhost:8000/boxes/BOX-CAL/calibrations/v1
+
+# 查询 0..5 区间的校准轨迹
+curl 'http://localhost:8000/boxes/BOX-CAL/calibrations/v1/trajectory?seq_from=0&seq_to=5'
+```
+
+轨迹响应（seq=1 在锚点 0/2 间线性插值得偏移 1.0；seq=5 超出末锚点，沿用 seq=4 的 -0.5；
+缺报的 seq=3 不出现）：
+
+```json
+{
+  "box_code": "BOX-CAL",
+  "version": "v1",
+  "seq_from": 0,
+  "seq_to": 5,
+  "event_count": 5,
+  "events": [
+    {"seq": 0, "event_time": "2026-09-25T00:00:00", "original_temperature": -5.0, "offset": 0.5, "calibrated_temperature": -4.5},
+    {"seq": 1, "event_time": "2026-09-25T00:01:00", "original_temperature": -5.0, "offset": 1.0, "calibrated_temperature": -4.0},
+    {"seq": 2, "event_time": "2026-09-25T00:02:00", "original_temperature": -5.0, "offset": 1.5, "calibrated_temperature": -3.5},
+    {"seq": 4, "event_time": "2026-09-25T00:04:00", "original_temperature": -5.0, "offset": -0.5, "calibrated_temperature": -5.5},
+    {"seq": 5, "event_time": "2026-09-25T00:05:00", "original_temperature": -5.0, "offset": -0.5, "calibrated_temperature": -5.5}
+  ]
+}
+```
+
+```bash
+# 锚点不足 2 个 / 序号不严格递增 / 偏移非有限值 -> 422
+curl -i -X POST http://localhost:8000/boxes/BOX-CAL/calibrations \
+  -H 'Content-Type: application/json' -d '{"version":"v2","anchors":[{"seq":0,"offset":0.5}]}'
+curl -i -X POST http://localhost:8000/boxes/BOX-CAL/calibrations \
+  -H 'Content-Type: application/json' \
+  -d '{"version":"v2","anchors":[{"seq":2,"offset":0.5},{"seq":2,"offset":0.6}]}'
+
+# 版本不存在 / 箱号不存在 -> 404；区间非法 -> 422
+curl -i 'http://localhost:8000/boxes/BOX-CAL/calibrations/v9/trajectory?seq_from=0&seq_to=5'
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/calibrations/v1/trajectory?seq_from=0&seq_to=5'
+curl -i 'http://localhost:8000/boxes/BOX-CAL/calibrations/v1/trajectory?seq_from=5&seq_to=2'
+```
+
 ## 设计说明
 
 - **去重键**：数据库对 `(box_code, seq)` 建唯一约束（`uq_box_seq`）。
@@ -913,6 +1025,16 @@ curl -i http://localhost:8000/handoffs/NO-SUCH-HANDOFF/reconcile/HO-20260924-01
   用耐心排序（bisect，O(n log n)）求最长递增子序列长度，
   最少需移动箱数 = 共同箱数 − LIS 长度；新增、移出不计移动，
   两份箱单相同（共同箱相对顺序一致）时为 0；任一快照不存在返回 404。
+- **校准锚点不可变**：`calibration_profiles` / `calibration_anchors` 两张表只增不改，
+  `(box_code, version)` 唯一约束作为幂等键，并发下同箱同版本创建由 `IntegrityError`
+  兜底重判。锚点在创建时一次性写入（至少两个、序号严格递增、偏移为有限浮点，
+  均在请求层校验，不满足返回 422）；同箱同版本同内容（锚点列表及顺序）的重交
+  直接返回原锚点集（200），内容不同返回 409。
+- **校准轨迹只读**：`trajectory` 接口复用区间事件查询（按 `seq` 升序、缺号不补点），
+  偏移在相邻锚点间按序号线性插值、两端之外沿用最近锚点；插值用 `Fraction`
+  精确计算后再转 float，锚点上的取值不受浮点误差影响。校准温度 = 原温度 + 偏移，
+  只在查询时即时计算并仅用于该接口响应，不写回 `box_events`，
+  也不参与现有状态与各类分析接口的计算；补报事件后重查即自动重算。
 - **校验错误兜底**：请求体携带 `NaN`/`Infinity` 时，校验错误的详情里会带上这些
   非有限浮点，而 Starlette 的 JSON 响应不允许序列化它们；`main.py` 自定义了
   `RequestValidationError` 处理器，先把错误详情中的 NaN/Inf 替换为字符串再返回 422，
